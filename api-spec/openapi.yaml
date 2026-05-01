@@ -1,0 +1,58 @@
+openapi: 3.0.0
+info:
+  title: API Asistente RAG Vitivinícola
+  description: API para la gestión del asistente conversacional basado en normativas del sector vitivinícola y sostenibilidad.
+  version: 1.0.0
+
+paths:
+  /ask:
+    post:
+      summary: Enviar una pregunta al asistente
+      description: Recibe una pregunta del viticultor y devuelve una respuesta generada por el LLM junto con las fuentes legales recuperadas (RAG).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                question:
+                  type: string
+                  example: "¿Qué requisitos tiene el Cuaderno Digital (CUE) para viñedos ecológicos?"
+      responses:
+        '200':
+          description: Respuesta generada exitosamente.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  answer:
+                    type: string
+                    example: "Según el RD 1048/2022, las explotaciones ecológicas deben..."
+                  sources:
+                    type: array
+                    items:
+                      type: string
+                      example: "BOE-A-2022-23054, pág 12"
+        '500':
+          description: Error interno del servidor al procesar el RAG.
+
+  /documents/ingest:
+    post:
+      summary: Subir nueva normativa al sistema
+      description: Endpoint para procesar PDFs (BOE, PAC) y convertirlos en embeddings en la base de datos vectorial.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: Documento PDF con la normativa.
+      responses:
+        '200':
+          description: Documento procesado e indexado correctamente.
