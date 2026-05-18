@@ -5,22 +5,27 @@ Implementa los endpoints definidos en /api-spec/openapi.yaml siguiendo
 la metodología Spec-Driven Development (SDD).
 
 Endpoints implementados:
-  - POST /ask              → Consulta al asistente RAG (mock)
+  - POST /ask              → Consulta RAG real (ChromaDB + Groq/Llama 3)
   - POST /documents/ingest → Ingesta real de PDFs normativos en ChromaDB
 
-Dependencias de ingesta (instalar con pip):
+Dependencias (instalar con pip):
   pip install pypdf langchain-community langchain-huggingface
-              sentence-transformers chromadb
+              sentence-transformers chromadb langchain-groq python-dotenv
+
+Variables de entorno requeridas (archivo /backend/.env):
+  GROQ_API_KEY=<tu_clave_groq>
 
 Autor: TFG - Delgado Rodríguez, Francisco Javier
 """
 
 import logging
+import os
 import shutil
 import uuid
 from pathlib import Path
 from typing import List
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -36,6 +41,21 @@ from langchain_huggingface import HuggingFaceEmbeddings
 
 # LangChain — base de datos vectorial ChromaDB
 from langchain_community.vectorstores import Chroma
+
+# LangChain — LLM Groq (Llama 3)
+from langchain_groq import ChatGroq
+
+# LangChain — LCEL (LangChain Expression Language)
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import Runnable, RunnablePassthrough
+from langchain_core.vectorstores import VectorStoreRetriever
+
+# ---------------------------------------------------------------------------
+# Carga de variables de entorno (.env)
+# ---------------------------------------------------------------------------
+# Se busca el .env en el directorio del propio fichero (backend/.env)
+load_dotenv(dotenv_path=Path(__file__).parent / ".env")
 
 
 # ---------------------------------------------------------------------------
@@ -71,10 +91,27 @@ CHROMA_COLLECTION: str = "normativas_vitivinicolas"
 # Modelo de embeddings local (descargado automáticamente la 1.ª vez, ~90 MB)
 EMBEDDINGS_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
 
+# Modelo LLM de Groq — se puede cambiar por otro disponible en la plataforma
+GROQ_MODEL: str = "llama-3.1-8b-instant"
+
+# Número de fragmentos a recuperar de ChromaDB por consulta
+TOP_K: int = 4
+
+# Prompt del sistema para el asistente RAG
+_SYSTEM_PROMPT: str = (
+    "Eres un asistente experto en normativas vitivinícolas españolas y europeas, "
+    "así como en el Cuaderno Digital de Explotación Agrícola (CUE). "
+    "Tu función es responder de forma precisa, clara y en español, "
+    "basándote ÚNICAMENTE en los fragmentos de documentos oficiales que se te proporcionan. "
+    "Si la información necesaria para responder no está en el contexto proporcionado, "
+    "indícalo explícitamente y NO inventes datos. "
+    "Cita siempre la fuente documental cuando sea posible.\n\n"
+    "Contexto recuperado de la base normativa:\n{context}"
+)
+
 
 # ---------------------------------------------------------------------------
-# Inicialización lazy de componentes pesados
-# (se instancian una sola vez al arrancar el servidor)
+# Inicialización de componentes pesados (una sola vez al arrancar)
 # ---------------------------------------------------------------------------
 
 def _load_embeddings() -> HuggingFaceEmbeddings:
@@ -83,8 +120,70 @@ def _load_embeddings() -> HuggingFaceEmbeddings:
     return HuggingFaceEmbeddings(model_name=EMBEDDINGS_MODEL)
 
 
-# Instancia global — se inicializa al primer arranque del servidor
+def _build_rag_components() -> tuple[VectorStoreRetriever, Runnable]:
+    """
+    Construye y devuelve los dos componentes del pipeline RAG usando
+    exclusivamente LCEL (LangChain Expression Language).
+    No importa nada de ``langchain.chains`` (eliminado en LangChain ≥ 1.0).
+
+    Returns:
+        Tupla ``(retriever, generation_chain)`` donde:
+        - ``retriever``: busca en ChromaDB y devuelve ``List[Document]``.
+        - ``generation_chain``: cadena LCEL ``prompt | llm | StrOutputParser``
+          que acepta ``{"context": str, "input": str}`` y retorna ``str``.
+
+    Raises:
+        RuntimeError: Si ``GROQ_API_KEY`` no está definida en el entorno.
+    """
+    groq_api_key: str | None = os.getenv("GROQ_API_KEY")
+    if not groq_api_key:
+        raise RuntimeError(
+            "La variable de entorno GROQ_API_KEY no está definida. "
+            "Añádela al archivo backend/.env."
+        )
+
+    # 1. Conectar a ChromaDB existente como retriever (solo lectura)
+    vectorstore = Chroma(
+        collection_name=CHROMA_COLLECTION,
+        embedding_function=_embeddings,
+        persist_directory=str(CHROMA_DB_DIR),
+    )
+    retriever: VectorStoreRetriever = vectorstore.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": TOP_K},
+    )
+    logger.info("Retriever ChromaDB listo (k=%d, colección='%s').", TOP_K, CHROMA_COLLECTION)
+
+    # 2. Instanciar el LLM de Groq
+    llm = ChatGroq(
+        model=GROQ_MODEL,
+        api_key=groq_api_key,
+        temperature=0.1,   # respuestas deterministas y factuales
+        max_tokens=1024,
+    )
+    logger.info("LLM Groq instanciado (modelo='%s').", GROQ_MODEL)
+
+    # 3. Prompt de sistema — {context} e {input} se sustituyen en el handler
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", _SYSTEM_PROMPT),
+            ("human", "{input}"),
+        ]
+    )
+
+    # 4. Cadena de generación pura LCEL: prompt | llm | parser
+    #    Acepta {"context": str, "input": str} → devuelve str
+    generation_chain: Runnable = prompt | llm | StrOutputParser()
+
+    logger.info("Componentes RAG (LCEL) ensamblados correctamente.")
+    return retriever, generation_chain
+
+
+# Instancias globales — inicializadas al arrancar el servidor
 _embeddings: HuggingFaceEmbeddings = _load_embeddings()
+_retriever: VectorStoreRetriever
+_generation_chain: Runnable
+_retriever, _generation_chain = _build_rag_components()
 
 
 # ---------------------------------------------------------------------------
@@ -184,40 +283,83 @@ app.add_middleware(
     summary="Enviar una pregunta al asistente",
     description=(
         "Recibe una pregunta del viticultor y devuelve una respuesta generada "
-        "por el LLM junto con las fuentes legales recuperadas (RAG). "
-        "⚠️ Respuesta simulada (mock): la integración con LangChain/ChromaDB está pendiente."
+        "por el LLM (Groq/Llama 3) junto con las fuentes normativas recuperadas "
+        "de la base vectorial ChromaDB local (pipeline RAG real)."
     ),
     tags=["RAG"],
 )
 async def ask(request: AskRequest) -> AskResponse:
     """
-    Procesa la pregunta del usuario y retorna una respuesta RAG simulada.
+    Ejecuta el pipeline RAG completo usando LCEL puro (sin langchain.chains).
+
+    Pipeline de dos pasos explícitos:
+      1. ``_retriever.ainvoke(question)``  →  List[Document] con metadatos.
+      2. Concatenación del contenido de los docs como contexto de texto plano.
+      3. ``_generation_chain.ainvoke({context, input})``  →  str con la respuesta.
+      4. Extracción de fuentes deduplicadas desde los metadatos de los docs.
 
     Args:
         request: Objeto ``AskRequest`` con el campo ``question``.
 
     Returns:
-        ``AskResponse`` con ``answer`` y lista de ``sources``.
+        ``AskResponse`` con ``answer`` (texto del LLM) y ``sources``
+        (lista deduplicada de referencias documentales con número de página).
 
     Raises:
-        HTTPException(500): Si el pipeline RAG produce un error interno
-                            (no activo en modo mock).
+        HTTPException(503): Si los componentes RAG no están disponibles.
+        HTTPException(500): Si ocurre un error durante la recuperación o inferencia.
     """
-    # --- MOCK: sustituir por pipeline LangChain + ChromaDB ---
-    mock_answer: str = (
-        "Según el RD 1048/2022, las explotaciones ecológicas deben registrar "
-        "en el Cuaderno de Explotación Único (CUE) todas las prácticas "
-        "fitosanitarias utilizando únicamente productos autorizados para la "
-        "producción ecológica conforme al Reglamento (CE) 889/2008."
-    )
-    mock_sources: List[str] = [
-        "BOE-A-2022-23054, pág. 12",
-        "RD 1048/2022, Art. 5",
-        "Reglamento (CE) 889/2008, Anexo II",
-    ]
-    # ----------------------------------------------------------
+    logger.info("Consulta RAG recibida: '%s'", request.question)
 
-    return AskResponse(answer=mock_answer, sources=mock_sources)
+    # ── Paso 1: Recuperar documentos relevantes de ChromaDB ──────────────────
+    try:
+        docs = await _retriever.ainvoke(request.question)
+    except Exception as exc:
+        logger.error("Error en la recuperación ChromaDB: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error al consultar la base de datos vectorial: {exc}",
+        ) from exc
+
+    logger.info("Documentos recuperados de ChromaDB: %d", len(docs))
+
+    # ── Paso 2: Formatear el contexto como texto plano ───────────────────────
+    # Cada Document contiene .page_content (texto) y .metadata (source, page)
+    context: str = "\n\n".join(doc.page_content for doc in docs)
+
+    # ── Paso 3: Generar respuesta con el LLM (LCEL: prompt | llm | parser) ───
+    try:
+        answer: str = await _generation_chain.ainvoke(
+            {"context": context, "input": request.question}
+        )
+    except Exception as exc:
+        logger.error("Error durante la inferencia con Groq: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error al generar la respuesta con el modelo de lenguaje: {exc}",
+        ) from exc
+
+    # ── Paso 4: Extraer fuentes únicas de los metadatos ─────────────────────
+    # PyPDFLoader añade: metadata["source"] = ruta del PDF, metadata["page"] = nº (0-indexed)
+    sources: List[str] = []
+    seen: set[str] = set()
+    for doc in docs:
+        meta = doc.metadata
+        source_file: str = Path(meta.get("source", "Fuente desconocida")).name
+        page_num: int | None = meta.get("page")  # 0-indexed → mostramos +1
+        ref: str = (
+            f"{source_file}, pág. {page_num + 1}"
+            if page_num is not None
+            else source_file
+        )
+        if ref not in seen:
+            seen.add(ref)
+            sources.append(ref)
+
+    logger.info(
+        "Respuesta generada. Fuentes consultadas (%d): %s", len(sources), sources
+    )
+    return AskResponse(answer=answer, sources=sources)
 
 
 @app.post(

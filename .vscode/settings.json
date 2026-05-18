@@ -1,0 +1,53 @@
+{
+  // ==========================================================================
+  // .vscode/settings.json — Configuración del workspace para el TFG RAG
+  // ==========================================================================
+  // Obliga a VS Code / Pylance a utilizar ÚNICAMENTE el intérprete y los
+  // site-packages del entorno virtual backend/venv, evitando que Pylance
+  // caiga al Python global o a un venv incorrecto.
+  // ==========================================================================
+
+  // ── Intérprete Python ──────────────────────────────────────────────────────
+  // Ruta relativa a la raíz del workspace (donde está esta carpeta .vscode)
+  "python.defaultInterpreterPath": "backend/venv/Scripts/python.exe",
+
+  // ── Análisis estático (Pylance) ────────────────────────────────────────────
+  // Rutas extra donde Pylance buscará módulos importados
+  "python.analysis.extraPaths": [
+    "backend/venv/Lib/site-packages"
+  ],
+
+  // Modo de verificación de tipos — básico es suficiente para un TFG
+  "python.analysis.typeCheckingMode": "basic",
+
+  // Excluir el propio venv del análisis (evita miles de warnings internos)
+  "python.analysis.exclude": [
+    "backend/venv/**"
+  ],
+
+  // ── Terminal integrada ─────────────────────────────────────────────────────
+  // Activa automáticamente el venv al abrir cualquier terminal en VS Code
+  "python.terminal.activateEnvironment": true,
+
+  // ── Formato y linting ──────────────────────────────────────────────────────
+  "[python]": {
+    "editor.formatOnSave": false,
+    "editor.defaultFormatter": null
+  },
+
+  // ── Archivos excluidos del explorador (no del análisis) ───────────────────
+  "files.exclude": {
+    "backend/venv": true,
+    "backend/__pycache__": true,
+    "backend/chroma_db": true,
+    "backend/temp": true,
+    "**/__pycache__": true,
+    "**/*.pyc": true
+  },
+
+  // ── Búsqueda — excluir carpetas pesadas ───────────────────────────────────
+  "search.exclude": {
+    "backend/venv/**": true,
+    "backend/chroma_db/**": true
+  }
+}
